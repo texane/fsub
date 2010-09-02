@@ -158,6 +158,28 @@ typedef struct fsub_context
 } fsub_context_t;
 
 
+static void sub_rect_block
+(fsub_context_t* fsc, index_t i, index_t j, size_t m, size_t n)
+{
+  /* b -= aij * x, a rect of size m,n */
+
+  const index_t last_i = i + n;
+  const index_t first_j = j;
+  const index_t last_j = j + m;
+
+  for (; i < last_i; ++i)
+  {
+    /* local accumulation */
+    double sum = 0.f;
+
+    for (j = first_j; j < last_j; ++j)
+      sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
+
+    /* update b -= sum(axi) */
+    *vector_at(fsc->b, i) -= sum;
+  }
+}
+
 static void __attribute__((unused)) sub_square_block
 (fsub_context_t* fsc, index_t i, index_t j, size_t n)
 {
@@ -179,7 +201,6 @@ static void __attribute__((unused)) sub_square_block
     *vector_at(fsc->b, i) -= sum;
   }
 }
-
 
 static void sub_tri_block(fsub_context_t* fsc, index_t i, size_t n)
 {
@@ -231,6 +252,12 @@ static void fsub_apply(fsub_context_t* fsc)
   sub_tri_block(fsc, 0, fsc->lsize);
   write_atomic_ul(&fsc->kkpos, 1UL);
 
+  /* step0': solve the band below
+   */
+
+  const size_t band_height = matrix_size(fsc->a) - fsc->lsize;
+  sub_rect_block(fsc, fsc->lsize, 0, fsc->lsize, band_height);
+
   /* step1: slide (kcount-1) kkblocks along the diagonal
      every processed kkblock unlocks a band of parallelism
      fsc->kkpos maintains the current kk block position
@@ -239,9 +266,19 @@ static void fsub_apply(fsub_context_t* fsc)
 
   const index_t last_i = (llcount - 1) * fsc->lsize;
 
-  index_t i;
-  for (i = 0; i < last_i; i += fsc->ksize, inc_atomic_ul(&fsc->kkpos))
+  index_t i = fsc->lsize;
+  for (; i < last_i; i += fsc->ksize, inc_atomic_ul(&fsc->kkpos))
+  {
     sub_tri_block(fsc, i, fsc->ksize);
+
+    /* step1': for now, the band is computed sequentially.
+       every thing is computed to mimic a stealer context 
+     */
+
+    const index_t si = (read_atomic_ul(&fsc->kkpos) + 1) * fsc->ksize;
+    const size_t sh = matrix_size(fsc->a) - si;
+    sub_rect_block(fsc, si, si, fsc->ksize, sh);
+  }
 
   /* step2: solve the last llblock
    */
