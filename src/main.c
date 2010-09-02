@@ -51,7 +51,7 @@ static int matrix_create_lower(matrix_t** m, size_t n)
   for (i = 0; i < n; ++i)
   {
     size_t j;
-    for (j = 1; j < i; ++j)
+    for (j = 1; j <= i; ++j)
       *matrix_at(*m, i, j - 1) = 1.f; /* rand() */
     *matrix_at(*m, i, i) = 1.f;
   }
@@ -62,6 +62,18 @@ static int matrix_create_lower(matrix_t** m, size_t n)
 static void matrix_destroy(matrix_t* m)
 {
   free(m);
+}
+
+static void __attribute__((unused)) matrix_print(const matrix_t* m)
+{
+  size_t i, j;
+
+  for (i = 0; i < m->n; ++i)
+  {
+    for (j = 0; j < m->n; ++j)
+      printf(" %lf", *matrix_const_at(m, i, j));
+    printf("\n");
+  }
 }
 
 
@@ -85,8 +97,8 @@ static inline size_t vector_size(const vector_t* v)
   return v->n;
 }
 
-static int vector_create(vector_t** v, size_t n)
-{ 
+static int vector_create_empty(vector_t** v, size_t n)
+{
   const size_t total_size = offsetof(vector_t, data) + n * sizeof(double);
 
   *v = malloc(total_size);
@@ -95,6 +107,15 @@ static int vector_create(vector_t** v, size_t n)
 
   (*v)->n = n;
 
+  return 0;
+}
+
+static int vector_create(vector_t** v, size_t n)
+{
+  if (vector_create_empty(v, n) == -1)
+    return -1;
+
+  /* fill vector */
   size_t i;
   for (i = 0; i < n; ++i)
     *vector_at(*v, i) = 1.f; /* rand() */
@@ -111,7 +132,8 @@ static void vector_print(const vector_t* v)
 {
   size_t i;
   for (i = 0; i < v->n; ++i)
-    printf(" %lf", v->data[i]);
+    printf(" %d", (int)v->data[i]);
+  printf("\n");
 }
 
 
@@ -122,7 +144,6 @@ typedef struct fsub_context
 {
   /* ax = b; */
   const matrix_t* a;
-  const vector_t* x;
   vector_t* b;
 
   /* size of a kxk block */
@@ -149,13 +170,13 @@ static void __attribute__((unused)) sub_square_block
   for (; i < last_i; ++i)
   {
     /* local accumulation */
-    double bi = 0.f;
+    double sum = 0.f;
 
     for (j = first_j; j < last_j; ++j)
-      bi += *matrix_const_at(fsc->a, i, j) * (*vector_const_at(fsc->x, i));
+      sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
 
-    /* update b -= ax */
-    *vector_at(fsc->b, i) -= bi;
+    /* update b -= sum(axi) */
+    *vector_at(fsc->b, i) -= sum;
   }
 }
 
@@ -170,14 +191,14 @@ static void sub_tri_block(fsub_context_t* fsc, index_t i, size_t n)
   for (; i < last_i; ++i)
   {
     /* local accumulation */
-    double bi = 0.f;
+    double sum = 0.f;
 
     index_t j;
     for (j = first_i; j < i; ++j)
-      bi += *matrix_const_at(fsc->a, i, j) * (*vector_const_at(fsc->x, i));
+      sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
 
-    /* update b -= ax */
-    *vector_at(fsc->b, i) -= bi;
+    /* update b -= sum(axi) */
+    *vector_at(fsc->b, i) -= sum;
   }
 }
 
@@ -210,7 +231,7 @@ static void fsub_apply(fsub_context_t* fsc)
   sub_tri_block(fsc, 0, fsc->lsize);
   write_atomic_ul(&fsc->kkpos, 1UL);
 
-  /* step1: slide (kcount-1) kkblock along the diagonal
+  /* step1: slide (kcount-1) kkblocks along the diagonal
      every processed kkblock unlocks a band of parallelism
      fsc->kkpos maintains the current kk block position
      i is the same as fsc->kkpos in matrix coordinates
@@ -226,18 +247,17 @@ static void fsub_apply(fsub_context_t* fsc)
    */
 
   if (llcount > 1)
-    sub_tri_block(fsc, i * fsc->lsize, fsc->lsize);
+    sub_tri_block(fsc, i, fsc->lsize);
 }
 
 
 static void fsub_initialize
-(fsub_context_t* fsc, const matrix_t* a, const vector_t* x, vector_t* b)
+(fsub_context_t* fsc, const matrix_t* a, vector_t* b)
 {
 #define CONFIG_KSIZE (1)
 #define CONFIG_LSIZE (CONFIG_KSIZE * 3)
 
   fsc->a = a;
-  fsc->a = x;
   fsc->b = b;
 
   fsc->ksize = CONFIG_KSIZE;
@@ -252,30 +272,24 @@ int main(int ac, char** av)
   fsub_context_t fsc;
 
   matrix_t* a = NULL;
-  vector_t* x = NULL;
   vector_t* b = NULL;
 
-#define CONFIG_ASIZE (1000 * CONFIG_LSIZE)
+#define CONFIG_ASIZE (3 * CONFIG_LSIZE)
   if (matrix_create_lower(&a, CONFIG_ASIZE) == -1)
-    goto on_error;
-
-  if (vector_create(&x, CONFIG_ASIZE) == -1)
     goto on_error;
 
   if (vector_create(&b, CONFIG_ASIZE) == -1)
     goto on_error;
 
   /* apply forward substitution: ax = b */
-  fsub_initialize(&fsc, a, x, b);
+  fsub_initialize(&fsc, a, b);
   fsub_apply(&fsc);
 
-  vector_print(x);
+  vector_print(b);
 
  on_error:
   if (a != NULL)
     matrix_destroy(a);
-  if (x != NULL)
-    vector_destroy(x);
   if (b != NULL)
     vector_destroy(b);
 
