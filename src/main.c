@@ -161,11 +161,11 @@ typedef struct fsub_context
 static void sub_rect_block
 (fsub_context_t* fsc, index_t i, index_t j, size_t m, size_t n)
 {
-  /* b -= aij * x, a rect of size m,n */
+  /* b -= aij * x, a rect of width=m, height=n */
 
-  const index_t last_i = i + n;
   const index_t first_j = j;
   const index_t last_j = j + m;
+  const index_t last_i = i + n;
 
   for (; i < last_i; ++i)
   {
@@ -225,12 +225,12 @@ static void sub_tri_block(fsub_context_t* fsc, index_t i, size_t n)
 
 static inline unsigned long read_atomic_ul(volatile unsigned long* ul)
 {
-  return __sync_fetch_and_or(ul, 0UL);
+  return *ul;
 }
 
 static inline void write_atomic_ul(volatile unsigned long* ul, unsigned long n)
 {
-  __sync_fetch_and_and(ul, n);
+  *ul = n;
 }
 
 static inline void inc_atomic_ul(volatile unsigned long* ul)
@@ -250,7 +250,7 @@ static void fsub_apply(fsub_context_t* fsc)
    */
 
   sub_tri_block(fsc, 0, fsc->lsize);
-  write_atomic_ul(&fsc->kkpos, 1UL);
+  write_atomic_ul(&fsc->kkpos, fsc->lsize);
 
   /* step0': solve the band below
    */
@@ -272,12 +272,14 @@ static void fsub_apply(fsub_context_t* fsc)
     sub_tri_block(fsc, i, fsc->ksize);
 
     /* step1': for now, the band is computed sequentially.
-       every thing is computed to mimic a stealer context 
+       consider the kkpos block as processed. every thing
+       is computed to mimic a stealer context, ie. knowing
+       only kkpos.
      */
 
-    const index_t si = (read_atomic_ul(&fsc->kkpos) + 1) * fsc->ksize;
-    const size_t sh = matrix_size(fsc->a) - si;
-    sub_rect_block(fsc, si, si, fsc->ksize, sh);
+    const index_t sj = read_atomic_ul(&fsc->kkpos) * fsc->ksize;
+    const index_t si = sj + fsc->ksize;
+    sub_rect_block(fsc, si, sj, fsc->ksize, matrix_size(fsc->a) - si);
   }
 
   /* step2: solve the last llblock
