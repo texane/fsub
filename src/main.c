@@ -140,6 +140,11 @@ static void vector_print(const vector_t* v)
 /* forward substitution algorithm
  */
 
+#if CONFIG_PARALLEL
+/* forward decl */
+struct parwork;
+#endif
+
 typedef struct fsub_context
 {
   /* ax = b; */
@@ -152,8 +157,9 @@ typedef struct fsub_context
   /* size of a lxl block */
   size_t lsize;
 
-  /* current kkblock (not inclusive) */
-  volatile unsigned long kkpos __attribute__((aligned));
+#if CONFIG_PARALLEL
+  struct parwork* parwork;
+#endif
 
 } fsub_context_t;
 
@@ -238,6 +244,142 @@ static inline void inc_atomic_ul(volatile unsigned long* ul)
   __sync_fetch_and_add(ul, 1UL);
 }
 
+static inline void dec_atomic_ul(volatile unsigned long* ul)
+{
+  __sync_fetch_and_add(ul, -1);
+}
+
+
+#if CONFIG_PARALLEL
+
+/* spinlock */
+
+typedef struct spinlock
+{
+  volatile unsigned long value;
+} spinlock_t;
+
+static inline void spinlock_init(spinlock_t* l)
+
+  l->value = 0;
+}
+
+static inline int spinlock_trylock(spinlock_t* l)
+{
+  return __sync_compare_and_swap(&l->value, 0, 1);
+}
+
+static inline void spinlock_unlock(spinlock_t* l)
+{
+  __sync_fetch_and_and(&l->lock, 0);
+}
+
+
+/* parallel work */
+
+typedef struct parwork
+{
+  spinlock_t lock;
+
+  /* for global synchronization */
+  volatile unsigned long refn __attribute__((aligned));
+
+  /* area to be processed: (i,0,asize,j) */
+  volatile index_t i;
+  volatile index_t j;
+
+  /* last processed row index (non inclusive) */
+  volatile index_t last_i __attribute__((aligned));
+
+} parwork_t;
+
+static inline void parwork_init
+(parwork_t* w, fsub_context_t* fsc, index_t i, index_t j, size_t m, size_t n)
+{
+#define CONFIG_THREAD_COUNT 16
+  spinlock_init(&w->lock);
+  w->refn = CONFIG_THREAD_COUNT;
+  w->fsc = fsc;
+  w->i = i;
+  w->j = j;
+  w->m = m;
+  w->n = n;
+}
+
+static inline void parwork_synchronize(parwork_t* w)
+{
+  /* assume the lock is owned */
+  while (read_atomic_ul(&w->refn) != 1UL)
+    ;
+}
+
+static inline void parwork_lock(parwork_t* w)
+{
+  while (!spinlock_trylock(&w->lock))
+    ;
+}
+
+static inline void parwork_lock_with_sync(parwork_t* w)
+{
+  dec_atomic_ul(&w->refn);
+  parwork_lock(&w->lock);
+  inc_atomic_ul(&w->refn);
+}
+
+static inline void parwork_unlock(parwork_t* w)
+{
+  spinlock_unlock(&w->lock);
+}
+
+static void sub_row(fsub_context_t* fsc, index_t i, size_t m)
+{
+  /* b -= aij*x with j in [0,m[ */
+  const index_t last_j = j + m;
+  index_t j;
+
+  /* local accumulation */
+  double sum = 0.f;
+
+  for (j = 0; j < last_j; ++j)
+    sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
+
+  /* update b -= sum(axi) */
+  *vector_at(fsc->b, i) -= sum;
+}
+
+static void* parwork_entry(void* p)
+{
+  parwork_t* const w = (parwork_t*)p;
+
+  index_t i;
+  index_t j;
+
+  while (!read_atomic_ul(&w->isdone))
+  {
+    /* lock and extract a line to process */
+    parwork_lock_with_sync(w);
+    i = w->i++;
+    j = w->j;
+    parwork_unlock(w);
+
+    /* process row */
+    sub_row(w->fsc, i, j);
+
+    /* update the last processed i. no need for
+       atomic read since we are the only updater
+    */
+    if (i == parwork->last_i)
+      write_atomic_ul(&parwork->last_i, (unsigned long)i + 1);
+  }
+
+  /* todo: synchronize */
+
+  return NULL;
+}
+
+#endif /* CONFIG_PARALLEL */
+
+
 static void fsub_apply(fsub_context_t* fsc)
 {
   /* assume fsc->lsize >= matrix_size(fsc->a) */
@@ -246,45 +388,84 @@ static void fsub_apply(fsub_context_t* fsc)
 
   const size_t llcount = matrix_size(fsc->a) / fsc->lsize;
 
-  /* step0: solve the first llblock
-   */
-
+  /* solve the first llblock */
   sub_tri_block(fsc, 0, fsc->lsize);
-  write_atomic_ul(&fsc->kkpos, fsc->lsize);
 
-  /* step0': solve the band below
-   */
+  size_t band_height = matrix_size(fsc->a) - fsc->lsize;
 
-  const size_t band_height = matrix_size(fsc->a) - fsc->lsize;
+#if CONFIG_PARALLEL
+  /* post the band to process */
+  parwork_t parwork;
+  parwork_init(&parwork, fsc, fsc->lsize, 0, fsc->lsize, band_height);
+#else 
+  /* process the band sequentially */
   sub_rect_block(fsc, fsc->lsize, 0, fsc->lsize, band_height);
+#endif
 
-  /* step1: slide (kcount-1) kkblocks along the diagonal
-     every processed kkblock unlocks a band of parallelism
-     fsc->kkpos maintains the current kk block position
-     i is the same as fsc->kkpos in matrix coordinates
-   */
-
+  /* slide along all the kkblocks on the diagonal */
   const index_t last_i = (llcount - 1) * fsc->lsize;
-
-  index_t i = fsc->lsize;
-  for (; i < last_i; i += fsc->ksize, inc_atomic_ul(&fsc->kkpos))
+  index_t i;
+  for (i = fsc->lsize; i < last_i; i += fsc->ksize)
   {
+    const index_t next_i = i + fsc->ksize;
+
+#if CONFIG_PARALLEL
+    /* wait until left band processed
+       todo: contribute to the work while waiting
+    */
+    while ((index_t)read_atomic_ul(&parwork.last_i) < next_i)
+      ;
+#endif
+
+    /* process the kk block sequentially */
     sub_tri_block(fsc, i, fsc->ksize);
 
-    /* step1': for now, the band is computed sequentially.
-       consider the kkpos block as processed. every thing
-       is computed to mimic a stealer context, ie. knowing
-       only kkpos.
+    /* compute the sub block dimensions */
+    next_i = i + fsc->ksize;
+    const index_t sj = i;
+    const index_t si = sj + fsc->ksize;
+    const index_t sm = sj + fsc->ksize;
+    const index_t sn = parwork.i - (i + fsc->ksize);
+
+#if CONFIG_PARALLEL
+    /* sync on the parallel work, so that no
+       one is working while we are updating
+       the parwork area.
      */
 
-    const index_t sj = read_atomic_ul(&fsc->kkpos) * fsc->ksize;
-    const index_t si = sj + fsc->ksize;
-    sub_rect_block(fsc, si, sj, fsc->ksize, matrix_size(fsc->a) - si);
+    parwork_lock(&fsc->parwork.lock);
+    parwork_synchronize(&fsc->parwork);
+
+    /* update parwork area */
+    fsc->parwork.i = to_i(kkpos);
+    fsc->parwork.j = next_i;
+
+    unlock_work(&fsc->parwork);
+
+    /* process the band sequentially */
+    band_height = fsc->par_work;
+    sub_rect_block(fsc, fsc->lsize, 0, fsc->ksize, band_height);
+
+    /* update kpos */
+    inc_atomic_ul(&fsc->kpos);
+
+    /* post the new band to process */
+    push_work(sfc, bi, bj, fsc->ksize, matrix_size(fsc->a) - bi);
+#else
+    /* process the band sequentially */
+    sub_rect_block(fsc, bi, bj, fsc->ksize, matrix_size(fsc->a) - bi);
+#endif /* (CONFIG_PARALLEL == 0) */
   }
 
-  /* step2: solve the last llblock
-   */
+#if CONFIG_PARALLEL
+  /* wait until everyone is done */
+  lock_work(&fsc->parwork);
+  parwork_synchronize(&fsc->parwork);
+  write_atomic_ul(&fsc->parwork.isdone, 1UL);
+  unlock_work(&fsc->parwork);
+#endif
 
+  /* the last llblock sequentially */
   if (llcount > 1)
     sub_tri_block(fsc, i, fsc->lsize);
 }
