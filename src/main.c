@@ -3,23 +3,40 @@
 #include <stddef.h>
 #include <math.h>
 #include <sys/types.h>
+#include <sys/time.h>
+
+#ifndef __USE_GNU
+#define __USE_GNU
+#endif
+#include <sched.h>
+#include <pthread.h>
+
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_matrix.h>
+#include <gsl/gsl_permutation.h>
+#include <gsl/gsl_linalg.h>
 
 
-/* matrix
- */
+/* config */
+#define CONFIG_THREAD_COUNT 2
+#define CONFIG_KSIZE (1)
+#define CONFIG_LSIZE (CONFIG_KSIZE * 3)
+#define CONFIG_ASIZE (10 * CONFIG_LSIZE)
+#define CONFIG_ITER_COUNT 2
+#define CONFIG_TIME 1
+#define CONFIG_CHECK 0
+
+
+/* matrix */
 
 typedef size_t index_t;
 
-typedef struct matrix
-{
-  size_t n;
-  double data[1];
-} matrix_t;
+typedef gsl_matrix matrix_t;
 
 static inline const double* matrix_const_at
 (const matrix_t* m, index_t i, index_t j)
 {
-  return m->data + i * m->n + j;
+  return gsl_matrix_const_ptr(m, i, j);
 }
 
 static inline double* matrix_at(matrix_t* m, index_t i, index_t j)
@@ -29,7 +46,15 @@ static inline double* matrix_at(matrix_t* m, index_t i, index_t j)
 
 static inline size_t matrix_size(const matrix_t* m)
 {
-  return m->n;
+  return m->size1;
+}
+
+static inline int matrix_create_empty(matrix_t** m, size_t n)
+{
+  *m = gsl_matrix_alloc(n, n);
+  if (*m == NULL)
+    return -1;
+  return 0;
 }
 
 static int matrix_create_lower(matrix_t** m, size_t n)
@@ -38,14 +63,8 @@ static int matrix_create_lower(matrix_t** m, size_t n)
      the digaonal is filled with ones.
    */
 
-  const size_t total_size =
-    offsetof(matrix_t, data) + (n * n) * sizeof(double);
-
-  *m = malloc(total_size);
-  if (*m == NULL)
+  if (matrix_create_empty(m, n) == -1)
     return -1;
-
-  (*m)->n = n;
 
   size_t i;
   for (i = 0; i < n; ++i)
@@ -61,16 +80,23 @@ static int matrix_create_lower(matrix_t** m, size_t n)
 
 static void matrix_destroy(matrix_t* m)
 {
-  free(m);
+  gsl_matrix_free(m);
+}
+
+static void matrix_copy(matrix_t* a, const matrix_t* b)
+{
+  gsl_matrix_memcpy(a, b);
 }
 
 static void __attribute__((unused)) matrix_print(const matrix_t* m)
 {
+  const size_t size = m->size1;
+
   size_t i, j;
 
-  for (i = 0; i < m->n; ++i)
+  for (i = 0; i < size; ++i)
   {
-    for (j = 0; j < m->n; ++j)
+    for (j = 0; j < size; ++j)
       printf(" %lf", *matrix_const_at(m, i, j));
     printf("\n");
   }
@@ -80,11 +106,11 @@ static void __attribute__((unused)) matrix_print(const matrix_t* m)
 /* vector
  */
 
-typedef matrix_t vector_t;
+typedef gsl_vector vector_t;
 
 static inline const double* vector_const_at(const vector_t* v, index_t i)
 {
-  return v->data + i;
+  return gsl_vector_const_ptr(v, i);
 }
 
 static inline double* vector_at(vector_t* v, index_t i)
@@ -94,18 +120,14 @@ static inline double* vector_at(vector_t* v, index_t i)
 
 static inline size_t vector_size(const vector_t* v)
 {
-  return v->n;
+  return v->size;
 }
 
-static int vector_create_empty(vector_t** v, size_t n)
+static inline int vector_create_empty(vector_t** v, size_t n)
 {
-  const size_t total_size = offsetof(vector_t, data) + n * sizeof(double);
-
-  *v = malloc(total_size);
+  *v = gsl_vector_alloc(n);
   if (*v == NULL)
     return -1;
-
-  (*v)->n = n;
 
   return 0;
 }
@@ -125,25 +147,121 @@ static int vector_create(vector_t** v, size_t n)
 
 static void vector_destroy(vector_t* v)
 {
-  free(v);
+  gsl_vector_free(v);
 }
 
-static void vector_print(const vector_t* v)
+static void __attribute__((unused)) vector_print(const vector_t* v)
 {
   size_t i;
-  for (i = 0; i < v->n; ++i)
-    printf(" %d", (int)v->data[i]);
+  for (i = 0; i < v->size; ++i)
+    printf(" %d", (int)*vector_const_at(v, i));
   printf("\n");
 }
+
+static void vector_copy(vector_t* a, const vector_t* b)
+{
+  gsl_vector_memcpy(a, b);
+}
+
+#if CONFIG_CHECK
+static int vector_cmp(const vector_t* a, const vector_t* b)
+{
+  size_t i;
+  for (i = 0; i < a->size; ++i)
+    if (*vector_const_at(a, i) != *vector_const_at(b, i))
+      return -1;
+  return 0;
+}
+#endif
+
+
+/* atomic and spinlock
+ */
+
+typedef struct spinlock
+{
+  volatile unsigned long value;
+} spinlock_t;
+
+static inline unsigned long read_atomic_ul(volatile unsigned long* ul)
+{
+  return *ul;
+}
+
+static inline void write_atomic_ul(volatile unsigned long* ul, unsigned long n)
+{
+  *ul = n;
+}
+
+static inline void inc_atomic_ul(volatile unsigned long* ul)
+{
+  __sync_fetch_and_add(ul, 1UL);
+}
+
+static inline void dec_atomic_ul(volatile unsigned long* ul)
+{
+  __sync_fetch_and_add(ul, -1);
+}
+
+static inline void spinlock_init(spinlock_t* l)
+{
+  l->value = 0;
+}
+
+static inline int spinlock_trylock(spinlock_t* l)
+{
+  return __sync_bool_compare_and_swap(&l->value, 0, 1);
+}
+
+static inline void spinlock_unlock(spinlock_t* l)
+{
+  __sync_fetch_and_and(&l->value, 0);
+}
+
+
+/* thread pool
+ */
+
+struct fsub_context;
+
+typedef struct thread_block
+{
+#define THREAD_STATE_ZERO 0
+#define THREAD_STATE_DONE 1
+  volatile unsigned long state;
+
+  pthread_t thread;
+  unsigned long tid;
+
+  struct fsub_context* fsc;
+
+} thread_block_t;
+
+typedef struct thread_pool
+{
+  thread_block_t tbs[CONFIG_THREAD_COUNT];
+} thread_pool_t;
 
 
 /* forward substitution algorithm
  */
 
-#if CONFIG_PARALLEL
-/* forward decl */
-struct parwork;
-#endif
+typedef struct parwork
+{
+  spinlock_t lock;
+
+  /* for global synchronization */
+  volatile unsigned long refn __attribute__((aligned));
+
+  /* area to be processed: (i,0,asize,j) */
+  volatile index_t i;
+  volatile index_t j;
+
+  /* last processed row index (non inclusive) */
+  volatile index_t last_i __attribute__((aligned));
+
+} parwork_t;
+
 
 typedef struct fsub_context
 {
@@ -157,12 +275,123 @@ typedef struct fsub_context
   /* size of a lxl block */
   size_t lsize;
 
-#if CONFIG_PARALLEL
-  struct parwork* parwork;
-#endif
+  parwork_t parwork;
+  thread_pool_t pool;
 
 } fsub_context_t;
 
+
+static inline void parwork_init(parwork_t* w)
+{
+  spinlock_init(&w->lock);
+  w->refn = CONFIG_THREAD_COUNT;
+
+#define INVALID_MATRIX_INDEX ((index_t)-1)
+  w->i = INVALID_MATRIX_INDEX;
+  w->j = INVALID_MATRIX_INDEX;
+}
+
+static inline void parwork_synchronize(parwork_t* w)
+{
+  /* assume the lock is owned. wait until refn
+     drops to 1 meaning everyone reached it.
+   */
+
+  while (read_atomic_ul(&w->refn) != 1UL)
+    ;
+}
+
+static inline void parwork_lock(parwork_t* w)
+{
+  while (!spinlock_trylock(&w->lock))
+    ;
+}
+
+static inline void parwork_lock_with_sync(parwork_t* w)
+{
+  dec_atomic_ul(&w->refn);
+  parwork_lock(w);
+  inc_atomic_ul(&w->refn);
+}
+
+static inline void parwork_unlock(parwork_t* w)
+{
+  spinlock_unlock(&w->lock);
+}
+
+static void sub_row(fsub_context_t* fsc, index_t i, size_t m)
+{
+  /* b -= aij*x with j in [0,m[ */
+  index_t j;
+
+  /* local accumulation */
+  double sum = 0.f;
+
+  for (j = 0; j < m; ++j)
+    sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
+
+  /* update b -= sum(axi) */
+  *vector_at(fsc->b, i) -= sum;
+}
+
+static void parwork_next_row(fsub_context_t* fsc)
+{
+  /* continue processing the parallel work */
+
+  const size_t asize = matrix_size(fsc->a);
+  parwork_t* const w = &fsc->parwork;
+
+  index_t i = INVALID_MATRIX_INDEX;
+  index_t j = INVALID_MATRIX_INDEX;
+
+  parwork_lock_with_sync(w);
+  if (w->i < asize)
+  {
+    i = w->i++;
+    j = w->j;
+  }
+  parwork_unlock(w);
+
+  /* did not get work */
+  if (i == INVALID_MATRIX_INDEX)
+    return ;
+
+  /* printf("next_row(%u)\n", i); */
+
+  /* process the row */
+  sub_row(fsc, i, j);
+
+  /* update the last processed i. no need for
+     atomic read since we are the only updater
+  */
+  if (i == w->last_i)
+    write_atomic_ul(&w->last_i, (unsigned long)i + 1);
+}
+
+static void* parwork_entry(void* p)
+{
+  /* thief thread entry */
+
+  thread_block_t* const tb = (thread_block_t*)p;
+  fsub_context_t* const fsc = tb->fsc;
+
+  while (1)
+  {
+    switch (read_atomic_ul(&tb->state))
+    {
+    case THREAD_STATE_DONE:
+      return NULL;
+      break;
+
+    default:
+      /* process next row in parallel area */
+      parwork_next_row(fsc);
+      break;
+    }
+  }
+
+  return NULL;
+}
 
 static void sub_rect_block
 (fsub_context_t* fsc, index_t i, index_t j, size_t m, size_t n)
@@ -229,157 +458,6 @@ static void sub_tri_block(fsub_context_t* fsc, index_t i, size_t n)
   }
 }
 
-static inline unsigned long read_atomic_ul(volatile unsigned long* ul)
-{
-  return *ul;
-}
-
-static inline void write_atomic_ul(volatile unsigned long* ul, unsigned long n)
-{
-  *ul = n;
-}
-
-static inline void inc_atomic_ul(volatile unsigned long* ul)
-{
-  __sync_fetch_and_add(ul, 1UL);
-}
-
-static inline void dec_atomic_ul(volatile unsigned long* ul)
-{
-  __sync_fetch_and_add(ul, -1);
-}
-
-
-#if CONFIG_PARALLEL
-
-/* spinlock */
-
-typedef struct spinlock
-{
-  volatile unsigned long value;
-} spinlock_t;
-
-static inline void spinlock_init(spinlock_t* l)
-
-  l->value = 0;
-}
-
-static inline int spinlock_trylock(spinlock_t* l)
-{
-  return __sync_compare_and_swap(&l->value, 0, 1);
-}
-
-static inline void spinlock_unlock(spinlock_t* l)
-{
-  __sync_fetch_and_and(&l->lock, 0);
-}
-
-
-/* parallel work */
-
-typedef struct parwork
-{
-  spinlock_t lock;
-
-  /* for global synchronization */
-  volatile unsigned long refn __attribute__((aligned));
-
-  /* area to be processed: (i,0,asize,j) */
-  volatile index_t i;
-  volatile index_t j;
-
-  /* last processed row index (non inclusive) */
-  volatile index_t last_i __attribute__((aligned));
-
-} parwork_t;
-
-static inline void parwork_init
-(parwork_t* w, fsub_context_t* fsc, index_t i, index_t j, size_t m, size_t n)
-{
-#define CONFIG_THREAD_COUNT 16
-  spinlock_init(&w->lock);
-  w->refn = CONFIG_THREAD_COUNT;
-  w->fsc = fsc;
-  w->i = i;
-  w->j = j;
-  w->m = m;
-  w->n = n;
-}
-
-static inline void parwork_synchronize(parwork_t* w)
-{
-  /* assume the lock is owned */
-  while (read_atomic_ul(&w->refn) != 1UL)
-    ;
-}
-
-static inline void parwork_lock(parwork_t* w)
-{
-  while (!spinlock_trylock(&w->lock))
-    ;
-}
-
-static inline void parwork_lock_with_sync(parwork_t* w)
-{
-  dec_atomic_ul(&w->refn);
-  parwork_lock(&w->lock);
-  inc_atomic_ul(&w->refn);
-}
-
-static inline void parwork_unlock(parwork_t* w)
-{
-  spinlock_unlock(&w->lock);
-}
-
-static void sub_row(fsub_context_t* fsc, index_t i, size_t m)
-{
-  /* b -= aij*x with j in [0,m[ */
-  const index_t last_j = j + m;
-  index_t j;
-
-  /* local accumulation */
-  double sum = 0.f;
-
-  for (j = 0; j < last_j; ++j)
-    sum += *matrix_const_at(fsc->a, i, j) * *vector_const_at(fsc->b, j);
-
-  /* update b -= sum(axi) */
-  *vector_at(fsc->b, i) -= sum;
-}
-
-static void* parwork_entry(void* p)
-{
-  parwork_t* const w = (parwork_t*)p;
-
-  index_t i;
-  index_t j;
-
-  while (!read_atomic_ul(&w->isdone))
-  {
-    /* lock and extract a line to process */
-    parwork_lock_with_sync(w);
-    i = w->i++;
-    j = w->j;
-    parwork_unlock(w);
-
-    /* process row */
-    sub_row(w->fsc, i, j);
-
-    /* update the last processed i. no need for
-       atomic read since we are the only updater
-    */
-    if (i == parwork->last_i)
-      write_atomic_ul(&parwork->last_i, (unsigned long)i + 1);
-  }
-
-  /* todo: synchronize */
-
-  return NULL;
-}
-
-#endif /* CONFIG_PARALLEL */
-
-
 static void fsub_apply(fsub_context_t* fsc)
 {
   /* assume fsc->lsize >= matrix_size(fsc->a) */
@@ -391,16 +469,12 @@ static void fsub_apply(fsub_context_t* fsc)
   /* solve the first llblock */
   sub_tri_block(fsc, 0, fsc->lsize);
 
-  size_t band_height = matrix_size(fsc->a) - fsc->lsize;
-
-#if CONFIG_PARALLEL
   /* post the band to process */
-  parwork_t parwork;
-  parwork_init(&parwork, fsc, fsc->lsize, 0, fsc->lsize, band_height);
-#else 
-  /* process the band sequentially */
-  sub_rect_block(fsc, fsc->lsize, 0, fsc->lsize, band_height);
-#endif
+  parwork_lock(&fsc->parwork);
+  fsc->parwork.i = fsc->lsize;
+  fsc->parwork.j = fsc->lsize;
+  fsc->parwork.last_i = fsc->lsize;
+  parwork_unlock(&fsc->parwork);
 
   /* slide along all the kkblocks on the diagonal */
   const index_t last_i = (llcount - 1) * fsc->lsize;
@@ -409,61 +483,41 @@ static void fsub_apply(fsub_context_t* fsc)
   {
     const index_t next_i = i + fsc->ksize;
 
-#if CONFIG_PARALLEL
-    /* wait until left band processed
-       todo: contribute to the work while waiting
-    */
-    while ((index_t)read_atomic_ul(&parwork.last_i) < next_i)
-      ;
-#endif
+    /* wait until left band processed */
+    while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < next_i)
+      parwork_next_row(fsc);
 
     /* process the kk block sequentially */
     sub_tri_block(fsc, i, fsc->ksize);
 
-    /* compute the sub block dimensions */
-    next_i = i + fsc->ksize;
-    const index_t sj = i;
-    const index_t si = sj + fsc->ksize;
-    const index_t sm = sj + fsc->ksize;
-    const index_t sn = parwork.i - (i + fsc->ksize);
-
-#if CONFIG_PARALLEL
     /* sync on the parallel work, so that no
        one is working while we are updating
        the parwork area.
      */
-
-    parwork_lock(&fsc->parwork.lock);
+    parwork_lock(&fsc->parwork);
     parwork_synchronize(&fsc->parwork);
 
-    /* update parwork area */
-    fsc->parwork.i = to_i(kkpos);
+    /* update parwork area j (which is next_i) */
     fsc->parwork.j = next_i;
 
-    unlock_work(&fsc->parwork);
+    /* updating the parwork area may have created
+       a hole below the kkblock. this hole dim are:
+       i + fsc->ksize, i, parwork.i, i + fsc->ksize
+       we must save parwork.i before unlocking workers
+    */
+    const index_t saved_i = fsc->parwork.i;
+
+    parwork_unlock(&fsc->parwork);
 
     /* process the band sequentially */
-    band_height = fsc->par_work;
-    sub_rect_block(fsc, fsc->lsize, 0, fsc->ksize, band_height);
-
-    /* update kpos */
-    inc_atomic_ul(&fsc->kpos);
-
-    /* post the new band to process */
-    push_work(sfc, bi, bj, fsc->ksize, matrix_size(fsc->a) - bi);
-#else
-    /* process the band sequentially */
-    sub_rect_block(fsc, bi, bj, fsc->ksize, matrix_size(fsc->a) - bi);
-#endif /* (CONFIG_PARALLEL == 0) */
+    const size_t band_height = saved_i - next_i;
+    sub_rect_block(fsc, next_i, i, band_height, fsc->ksize);
   }
 
-#if CONFIG_PARALLEL
-  /* wait until everyone is done */
-  lock_work(&fsc->parwork);
-  parwork_synchronize(&fsc->parwork);
-  write_atomic_ul(&fsc->parwork.isdone, 1UL);
-  unlock_work(&fsc->parwork);
-#endif
+  /* wait until remaining left bands processed */
+  const size_t asize = matrix_size(fsc->a);
+  while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < asize)
+    parwork_next_row(fsc);
 
   /* the last llblock sequentially */
   if (llcount > 1)
@@ -474,44 +528,144 @@ static void fsub_apply(fsub_context_t* fsc)
 static void fsub_initialize
 (fsub_context_t* fsc, const matrix_t* a, vector_t* b)
 {
-#define CONFIG_KSIZE (1)
-#define CONFIG_LSIZE (CONFIG_KSIZE * 3)
-
   fsc->a = a;
   fsc->b = b;
 
   fsc->ksize = CONFIG_KSIZE;
   fsc->lsize = CONFIG_LSIZE;
 
-  fsc->kkpos = 0UL;
+  parwork_init(&fsc->parwork);
+
+  size_t tid;
+  for (tid = 0; tid < CONFIG_THREAD_COUNT; ++tid)
+  {
+    thread_block_t* const tb = &fsc->pool.tbs[tid];
+
+    tb->state = THREAD_STATE_ZERO;
+    tb->tid = tid;
+    tb->fsc = fsc;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(tid, &cpuset);
+
+    if (tid == 0)
+    {
+      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      continue ;
+    }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+    pthread_create(&tb->thread, &attr, parwork_entry, (void*)tb);
+  }
 }
 
+
+static void fsub_finalize(fsub_context_t* fsc)
+{
+  size_t tid;
+  for (tid = 1; tid < CONFIG_THREAD_COUNT; ++tid)
+  {
+    write_atomic_ul(&fsc->pool.tbs[tid].state, THREAD_STATE_DONE);
+    pthread_join(fsc->pool.tbs[tid].thread, NULL);
+  }
+}
+
+
+static void fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
+{
+  gsl_permutation* const p = gsl_permutation_alloc(vector_size(b));
+  if (p == NULL)
+    return ;
+
+  int signum;
+  gsl_linalg_LU_decomp(a, p, &signum);
+  gsl_linalg_LU_solve(a, p, b, x);
+
+  gsl_permutation_free(p);
+}
+
+
+/* main */
 
 int main(int ac, char** av)
 {
   fsub_context_t fsc;
 
   matrix_t* a = NULL;
+  matrix_t* const_a = NULL;
+  vector_t* x = NULL;
+  vector_t* const_b = NULL;
   vector_t* b = NULL;
 
-#define CONFIG_ASIZE (3 * CONFIG_LSIZE)
-  if (matrix_create_lower(&a, CONFIG_ASIZE) == -1)
+  if (matrix_create_lower(&const_a, CONFIG_ASIZE) == -1)
+    goto on_error;
+  if (matrix_create_empty(&a, CONFIG_ASIZE) == -1)
     goto on_error;
 
-  if (vector_create(&b, CONFIG_ASIZE) == -1)
+  if (vector_create(&const_b, CONFIG_ASIZE) == -1)
     goto on_error;
+  if (vector_create_empty(&b, CONFIG_ASIZE) == -1)
+    goto on_error;
+
+  if (vector_create_empty(&x, CONFIG_ASIZE) == -1)
+    goto on_error;
+
+  fsub_initialize(&fsc, const_a, b);
 
   /* apply forward substitution: ax = b */
-  fsub_initialize(&fsc, a, b);
-  fsub_apply(&fsc);
+  size_t i;
+  for (i = 0; i < CONFIG_ITER_COUNT; ++i)
+  {
+    struct timeval tms[4];
 
-  vector_print(b);
+    matrix_copy(a, const_a);
+    vector_copy(b, const_b);
+
+    /* ref first since fsub_apply modifies */
+    gettimeofday(&tms[0], NULL);
+    fsub_apply_ref(a, x, const_b);
+    gettimeofday(&tms[1], NULL);
+    timersub(&tms[1], &tms[0], &tms[2]);
+
+    gettimeofday(&tms[0], NULL);
+    fsub_apply(&fsc);
+    gettimeofday(&tms[1], NULL);
+    timersub(&tms[1], &tms[0], &tms[3]);
+
+    vector_print(x);
+    vector_print(fsc.b);
+
+#if CONFIG_TIME
+    printf("times: %lu %lu\n",
+	   tms[2].tv_sec * 1000000 + tms[2].tv_usec,
+	   tms[3].tv_sec * 1000000 + tms[3].tv_usec);
+#endif
+
+#if CONFIG_CHECK
+    if (vector_cmp(fsc.b, x))
+    {
+      vector_print(fsc.b);
+      vector_print(x);
+    }
+#endif
+  }
+
+  fsub_finalize(&fsc);
 
  on_error:
   if (a != NULL)
     matrix_destroy(a);
+  if (const_a != NULL)
+    matrix_destroy(const_a);
+  if (x != NULL)
+    vector_destroy(x);
   if (b != NULL)
     vector_destroy(b);
+  if (const_b != NULL)
+    vector_destroy(const_b);
 
   return 0;
 }
