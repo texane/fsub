@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <unistd.h>
 #include <math.h>
 #include <sys/types.h>
 #include <sys/time.h>
@@ -18,13 +19,13 @@
 
 
 /* config */
-#define CONFIG_THREAD_COUNT 2
-#define CONFIG_KSIZE (2)
-#define CONFIG_LSIZE (2 * CONFIG_KSIZE)
-#define CONFIG_ASIZE (10 * CONFIG_LSIZE)
-#define CONFIG_ITER_COUNT 10
+#define CONFIG_THREAD_COUNT 4
+#define CONFIG_KSIZE (4)
+#define CONFIG_LSIZE (16 * CONFIG_KSIZE)
+#define CONFIG_ASIZE (100 * CONFIG_LSIZE)
+#define CONFIG_ITER_COUNT 5
 #define CONFIG_TIME 1
-#define CONFIG_CHECK 1
+#define CONFIG_CHECK 0
 
 
 /* matrix */
@@ -477,8 +478,6 @@ static void fsub_apply(fsub_context_t* fsc)
   fsc->parwork.last_i = fsc->lsize;
   parwork_unlock(&fsc->parwork);
 
-  /* printf("a\n"); fflush(stdout); */
-
   /* slide along all the kkblocks on the diagonal */
   const index_t last_i = (llcount - 1) * fsc->lsize;
   index_t i;
@@ -486,35 +485,30 @@ static void fsub_apply(fsub_context_t* fsc)
   {
     const index_t next_i = i + fsc->ksize;
 
-    /* printf("aa(%lu)\n", next_i); fflush(stdout); */
-
     /* wait until left band processed */
     while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < next_i)
       parwork_next_row(fsc);
-
-    /* printf("ab\n"); fflush(stdout); */
-
-    /* process the kk block sequentially */
-    sub_tri_block(fsc, i, fsc->ksize);
 
     /* sync on the parallel work, so that no
        one is working while we are updating
        the parwork area.
      */
     parwork_lock(&fsc->parwork);
+
     parwork_synchronize(&fsc->parwork);
 
-    /* printf("ac\n"); fflush(stdout); */
+    /* process the kk block sequentially */
+    sub_tri_block(fsc, i, fsc->ksize);
 
     /* update parwork area j (which is next_i) */
     fsc->parwork.j = next_i;
 
     /* updating the parwork area may have created
        a hole below the kkblock. this hole dim are:
-       i + fsc->ksize, i, parwork.i, i + fsc->ksize
-       we must save parwork.i before unlocking workers
+       i + fsc->ksize, i, parwork.last_i, i + fsc->ksize
+       we must save parwork.last_i before unlocking workers
     */
-    const index_t saved_i = fsc->parwork.i;
+    const index_t saved_i = fsc->parwork.last_i;
 
     parwork_unlock(&fsc->parwork);
 
@@ -523,14 +517,10 @@ static void fsub_apply(fsub_context_t* fsc)
     sub_rect_block(fsc, next_i, i, band_height, fsc->ksize);
   }
 
-  /* printf("b\n"); fflush(stdout); */
-
   /* wait until remaining left bands processed */
   const size_t asize = matrix_size(fsc->a);
   while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < asize)
     parwork_next_row(fsc);
-
-  /* printf("c\n"); fflush(stdout); */
 
   /* the last llblock sequentially */
   if (llcount > 1)
@@ -587,7 +577,8 @@ static void fsub_finalize(fsub_context_t* fsc)
 }
 
 
-static void fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
+static void __attribute__((unused))
+fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
 {
   gsl_permutation* const p = gsl_permutation_alloc(vector_size(b));
   if (p == NULL)
@@ -601,8 +592,7 @@ static void fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
 }
 
 
-#if 0
-static void fsub_apply_seq(matrix_t* a, vector_t* x, const vector_t* b)
+static void fsub_apply_seq(matrix_t* a, vector_t* b)
 {
   /* b -= aij * x, a triangle of size n */
 
@@ -619,10 +609,9 @@ static void fsub_apply_seq(matrix_t* a, vector_t* x, const vector_t* b)
       sum += *matrix_const_at(a, i, j) * *vector_const_at(b, j);
 
     /* update b -= sum(axi) */
-    *vector_at(fsc->b, i) -= sum;
+    *vector_at(b, i) -= sum;
   }
 }
-#endif
 
 
 /* main */
@@ -663,7 +652,11 @@ int main(int ac, char** av)
 
     /* ref first since fsub_apply modifies */
     gettimeofday(&tms[0], NULL);
+#if CONFIG_CHECK
     fsub_apply_ref(a, x, const_b);
+#else
+    fsub_apply_seq(a, b);
+#endif
     gettimeofday(&tms[1], NULL);
     timersub(&tms[1], &tms[0], &tms[2]);
 
@@ -683,6 +676,7 @@ int main(int ac, char** av)
     {
       vector_print(fsc.b);
       vector_print(x);
+      exit(-1);
     }
 #endif
   }
