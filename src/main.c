@@ -19,12 +19,12 @@
 
 /* config */
 #define CONFIG_THREAD_COUNT 2
-#define CONFIG_KSIZE (1)
-#define CONFIG_LSIZE (CONFIG_KSIZE * 3)
+#define CONFIG_KSIZE (2)
+#define CONFIG_LSIZE (2 * CONFIG_KSIZE)
 #define CONFIG_ASIZE (10 * CONFIG_LSIZE)
-#define CONFIG_ITER_COUNT 2
+#define CONFIG_ITER_COUNT 10
 #define CONFIG_TIME 1
-#define CONFIG_CHECK 0
+#define CONFIG_CHECK 1
 
 
 /* matrix */
@@ -195,12 +195,18 @@ static inline void write_atomic_ul(volatile unsigned long* ul, unsigned long n)
 
 static inline void inc_atomic_ul(volatile unsigned long* ul)
 {
-  __sync_fetch_and_add(ul, 1UL);
+  __sync_fetch_and_add(ul, 1);
 }
 
 static inline void dec_atomic_ul(volatile unsigned long* ul)
 {
   __sync_fetch_and_add(ul, -1);
+}
+
+static inline int cas_atomic_ul
+(volatile unsigned long* a, unsigned long b, unsigned long c)
+{
+  return __sync_bool_compare_and_swap(a, b, c);
 }
 
 static inline void spinlock_init(spinlock_t* l)
@@ -356,16 +362,11 @@ static void parwork_next_row(fsub_context_t* fsc)
   if (i == INVALID_MATRIX_INDEX)
     return ;
 
-  /* printf("next_row(%u)\n", i); */
-
   /* process the row */
   sub_row(fsc, i, j);
 
-  /* update the last processed i. no need for
-     atomic read since we are the only updater
-  */
-  if (i == w->last_i)
-    write_atomic_ul(&w->last_i, (unsigned long)i + 1);
+  /* update the last processed i */
+  inc_atomic_ul(&w->last_i);
 }
 
 static void* parwork_entry(void* p)
@@ -476,6 +477,8 @@ static void fsub_apply(fsub_context_t* fsc)
   fsc->parwork.last_i = fsc->lsize;
   parwork_unlock(&fsc->parwork);
 
+  /* printf("a\n"); fflush(stdout); */
+
   /* slide along all the kkblocks on the diagonal */
   const index_t last_i = (llcount - 1) * fsc->lsize;
   index_t i;
@@ -483,9 +486,13 @@ static void fsub_apply(fsub_context_t* fsc)
   {
     const index_t next_i = i + fsc->ksize;
 
+    /* printf("aa(%lu)\n", next_i); fflush(stdout); */
+
     /* wait until left band processed */
     while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < next_i)
       parwork_next_row(fsc);
+
+    /* printf("ab\n"); fflush(stdout); */
 
     /* process the kk block sequentially */
     sub_tri_block(fsc, i, fsc->ksize);
@@ -496,6 +503,8 @@ static void fsub_apply(fsub_context_t* fsc)
      */
     parwork_lock(&fsc->parwork);
     parwork_synchronize(&fsc->parwork);
+
+    /* printf("ac\n"); fflush(stdout); */
 
     /* update parwork area j (which is next_i) */
     fsc->parwork.j = next_i;
@@ -514,10 +523,14 @@ static void fsub_apply(fsub_context_t* fsc)
     sub_rect_block(fsc, next_i, i, band_height, fsc->ksize);
   }
 
+  /* printf("b\n"); fflush(stdout); */
+
   /* wait until remaining left bands processed */
   const size_t asize = matrix_size(fsc->a);
   while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < asize)
     parwork_next_row(fsc);
+
+  /* printf("c\n"); fflush(stdout); */
 
   /* the last llblock sequentially */
   if (llcount > 1)
@@ -588,6 +601,30 @@ static void fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
 }
 
 
+#if 0
+static void fsub_apply_seq(matrix_t* a, vector_t* x, const vector_t* b)
+{
+  /* b -= aij * x, a triangle of size n */
+
+  const size_t asize = matrix_size(a);
+
+  index_t i, j;
+
+  for (i = 0; i < asize; ++i)
+  {
+    /* local accumulation */
+    double sum = 0.f;
+
+    for (j = 0; j < i; ++j)
+      sum += *matrix_const_at(a, i, j) * *vector_const_at(b, j);
+
+    /* update b -= sum(axi) */
+    *vector_at(fsc->b, i) -= sum;
+  }
+}
+#endif
+
+
 /* main */
 
 int main(int ac, char** av)
@@ -635,11 +672,8 @@ int main(int ac, char** av)
     gettimeofday(&tms[1], NULL);
     timersub(&tms[1], &tms[0], &tms[3]);
 
-    vector_print(x);
-    vector_print(fsc.b);
-
 #if CONFIG_TIME
-    printf("times: %lu %lu\n",
+    printf("times: seq=%lu par=%lu\n",
 	   tms[2].tv_sec * 1000000 + tms[2].tv_usec,
 	   tms[3].tv_sec * 1000000 + tms[3].tv_usec);
 #endif
