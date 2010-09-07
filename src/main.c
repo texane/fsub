@@ -21,8 +21,8 @@
 
 /* config */
 #define CONFIG_THREAD_COUNT 8
-#define CONFIG_KSIZE (50)
-#define CONFIG_LSIZE (5 * CONFIG_KSIZE)
+#define CONFIG_KSIZE (40)
+#define CONFIG_LSIZE (4 * CONFIG_KSIZE)
 #define CONFIG_ASIZE (20 * CONFIG_LSIZE)
 #define CONFIG_ITER_COUNT 5
 #define CONFIG_TIME 1
@@ -121,7 +121,7 @@ typedef struct parwork
   volatile index_t j;
 
   /* last processed row index (non inclusive) */
-  volatile index_t last_i __attribute__((aligned));
+  volatile index_t row_count __attribute__((aligned));
 
 } parwork_t;
 
@@ -222,8 +222,8 @@ static void parwork_next_row(fsub_context_t* fsc)
   /* process the row */
   sub_row(fsc, i, j);
 
-  /* update the last processed i */
-  inc_atomic_ul(&w->last_i);
+  /* update processed row_count */
+  inc_atomic_ul(&w->row_count);
 }
 
 static void* parwork_entry(void* p)
@@ -331,7 +331,7 @@ static void fsub_apply(fsub_context_t* fsc)
   parwork_lock(&fsc->parwork);
   fsc->parwork.i = fsc->lsize;
   fsc->parwork.j = fsc->lsize;
-  fsc->parwork.last_i = fsc->lsize;
+  fsc->parwork.row_count = fsc->lsize;
   parwork_unlock(&fsc->parwork);
 
   /* slide along all the kkblocks on the diagonal */
@@ -347,14 +347,14 @@ static void fsub_apply(fsub_context_t* fsc)
      */
     while (1)
     {
-      if ((index_t)read_atomic_ul(&fsc->parwork.last_i) >= next_i)
+      if ((index_t)read_atomic_ul(&fsc->parwork.row_count) >= next_i)
       {
 	parwork_lock(&fsc->parwork);
 	parwork_synchronize(&fsc->parwork);
 	break ;
       }
 
-      /* contribute to work */
+      /* contribute to the parallel work */
       parwork_next_row(fsc);
     }
 
@@ -366,24 +366,24 @@ static void fsub_apply(fsub_context_t* fsc)
 
     /* updating the parwork area may have created
        a hole below the kkblock. this hole dim are:
-       i + fsc->ksize, i, parwork.last_i, i + fsc->ksize
-       we must save parwork.last_i before unlocking workers
+       i + fsc->ksize, i, parwork.row_count, i + fsc->ksize
+       capture parwork.row_count before unlocking workers
     */
-    const index_t saved_i = fsc->parwork.last_i;
+    const index_t row_count = fsc->parwork.row_count;
 
     parwork_unlock(&fsc->parwork);
 
     /* process the band sequentially */
-    const size_t band_height = saved_i - next_i;
+    const size_t band_height = row_count - next_i;
     sub_rect_block(fsc, next_i, i, band_height, fsc->ksize);
   }
 
   /* wait until remaining left bands processed */
   const size_t asize = matrix_size(fsc->a);
-  while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < asize)
+  while ((index_t)read_atomic_ul(&fsc->parwork.row_count) < asize)
     parwork_next_row(fsc);
 
-  /* the last llblock sequentially */
+  /* proces last llblock sequentially */
   if (llcount > 1)
     sub_tri_block(fsc, i, fsc->lsize);
 }
