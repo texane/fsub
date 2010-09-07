@@ -20,14 +20,14 @@
 
 
 /* config */
-#define CONFIG_THREAD_COUNT 4
-#define CONFIG_KSIZE (4)
-#define CONFIG_LSIZE (10 * CONFIG_KSIZE)
-#define CONFIG_ASIZE (10 * CONFIG_LSIZE)
+#define CONFIG_THREAD_COUNT 8
+#define CONFIG_KSIZE (50)
+#define CONFIG_LSIZE (5 * CONFIG_KSIZE)
+#define CONFIG_ASIZE (20 * CONFIG_LSIZE)
 #define CONFIG_ITER_COUNT 5
 #define CONFIG_TIME 1
-#define CONFIG_CHECK 1 /* run the reference code */
 #define CONFIG_SEQ 1 /* run the sequential code */
+#define CONFIG_CHECK 0 /* run the reference code */
 
 
 /* atomic and spinlock
@@ -341,17 +341,18 @@ static void fsub_apply(fsub_context_t* fsc)
   {
     const index_t next_i = i + fsc->ksize;
 
-    /* wait until left band processed */
-
+    /* wait until left band processed. the loop is left
+       with the lock held and no one working, thus safe
+       to process the kk block and update parwork
+     */
     while (1)
     {
-      parwork_lock(&fsc->parwork);
-      parwork_synchronize(&fsc->parwork);
-      const index_t tmp = (index_t)read_atomic_ul(&fsc->parwork.last_i);
-      parwork_unlock(&fsc->parwork);
-
-      if (tmp >= next_i)
+      if ((index_t)read_atomic_ul(&fsc->parwork.last_i) >= next_i)
+      {
+	parwork_lock(&fsc->parwork);
+	parwork_synchronize(&fsc->parwork);
 	break ;
+      }
 
       /* contribute to work */
       parwork_next_row(fsc);
@@ -359,14 +360,6 @@ static void fsub_apply(fsub_context_t* fsc)
 
     /* process the kk block sequentially */
     sub_tri_block(fsc, i, fsc->ksize);
-
-    /* sync on the parallel work, so that no
-       one is working while we are updating
-       the parwork area.
-     */
-    parwork_lock(&fsc->parwork);
-
-    parwork_synchronize(&fsc->parwork);
 
     /* update parwork area j (which is next_i) */
     fsc->parwork.j = next_i;
