@@ -12,168 +12,22 @@
 #include <sched.h>
 #include <pthread.h>
 
-#include <gsl/gsl_vector.h>
-#include <gsl/gsl_matrix.h>
 #include <gsl/gsl_permutation.h>
 #include <gsl/gsl_linalg.h>
+
+#include "vector.h"
+#include "matrix.h"
 
 
 /* config */
 #define CONFIG_THREAD_COUNT 4
 #define CONFIG_KSIZE (4)
-#define CONFIG_LSIZE (16 * CONFIG_KSIZE)
-#define CONFIG_ASIZE (100 * CONFIG_LSIZE)
+#define CONFIG_LSIZE (10 * CONFIG_KSIZE)
+#define CONFIG_ASIZE (10 * CONFIG_LSIZE)
 #define CONFIG_ITER_COUNT 5
 #define CONFIG_TIME 1
-#define CONFIG_CHECK 0
-
-
-/* matrix */
-
-typedef size_t index_t;
-
-typedef gsl_matrix matrix_t;
-
-static inline const double* matrix_const_at
-(const matrix_t* m, index_t i, index_t j)
-{
-  return gsl_matrix_const_ptr(m, i, j);
-}
-
-static inline double* matrix_at(matrix_t* m, index_t i, index_t j)
-{
-  return (double*)matrix_const_at(m, i, j);
-}
-
-static inline size_t matrix_size(const matrix_t* m)
-{
-  return m->size1;
-}
-
-static inline int matrix_create_empty(matrix_t** m, size_t n)
-{
-  *m = gsl_matrix_alloc(n, n);
-  if (*m == NULL)
-    return -1;
-  return 0;
-}
-
-static int matrix_create_lower(matrix_t** m, size_t n)
-{ 
-  /* create a lower triangular matrix.
-     the digaonal is filled with ones.
-   */
-
-  if (matrix_create_empty(m, n) == -1)
-    return -1;
-
-  size_t i;
-  for (i = 0; i < n; ++i)
-  {
-    size_t j;
-    for (j = 1; j <= i; ++j)
-      *matrix_at(*m, i, j - 1) = 1.f; /* rand() */
-    *matrix_at(*m, i, i) = 1.f;
-  }
-
-  return 0;
-}
-
-static void matrix_destroy(matrix_t* m)
-{
-  gsl_matrix_free(m);
-}
-
-static void matrix_copy(matrix_t* a, const matrix_t* b)
-{
-  gsl_matrix_memcpy(a, b);
-}
-
-static void __attribute__((unused)) matrix_print(const matrix_t* m)
-{
-  const size_t size = m->size1;
-
-  size_t i, j;
-
-  for (i = 0; i < size; ++i)
-  {
-    for (j = 0; j < size; ++j)
-      printf(" %lf", *matrix_const_at(m, i, j));
-    printf("\n");
-  }
-}
-
-
-/* vector
- */
-
-typedef gsl_vector vector_t;
-
-static inline const double* vector_const_at(const vector_t* v, index_t i)
-{
-  return gsl_vector_const_ptr(v, i);
-}
-
-static inline double* vector_at(vector_t* v, index_t i)
-{
-  return (double*)vector_const_at(v, i);
-}
-
-static inline size_t vector_size(const vector_t* v)
-{
-  return v->size;
-}
-
-static inline int vector_create_empty(vector_t** v, size_t n)
-{
-  *v = gsl_vector_alloc(n);
-  if (*v == NULL)
-    return -1;
-
-  return 0;
-}
-
-static int vector_create(vector_t** v, size_t n)
-{
-  if (vector_create_empty(v, n) == -1)
-    return -1;
-
-  /* fill vector */
-  size_t i;
-  for (i = 0; i < n; ++i)
-    *vector_at(*v, i) = 1.f; /* rand() */
-
-  return 0;
-}
-
-static void vector_destroy(vector_t* v)
-{
-  gsl_vector_free(v);
-}
-
-static void __attribute__((unused)) vector_print(const vector_t* v)
-{
-  size_t i;
-  for (i = 0; i < v->size; ++i)
-    printf(" %d", (int)*vector_const_at(v, i));
-  printf("\n");
-}
-
-static void vector_copy(vector_t* a, const vector_t* b)
-{
-  gsl_vector_memcpy(a, b);
-}
-
-#if CONFIG_CHECK
-static int vector_cmp(const vector_t* a, const vector_t* b)
-{
-  size_t i;
-  for (i = 0; i < a->size; ++i)
-    if (*vector_const_at(a, i) != *vector_const_at(b, i))
-      return -1;
-  return 0;
-}
-#endif
+#define CONFIG_CHECK 1 /* run the reference code */
+#define CONFIG_SEQ 1 /* run the sequential code */
 
 
 /* atomic and spinlock
@@ -252,6 +106,8 @@ typedef struct thread_pool
 
 /* forward substitution algorithm
  */
+
+typedef size_t index_t;
 
 typedef struct parwork
 {
@@ -486,8 +342,23 @@ static void fsub_apply(fsub_context_t* fsc)
     const index_t next_i = i + fsc->ksize;
 
     /* wait until left band processed */
-    while ((index_t)read_atomic_ul(&fsc->parwork.last_i) < next_i)
+
+    while (1)
+    {
+      parwork_lock(&fsc->parwork);
+      parwork_synchronize(&fsc->parwork);
+      const index_t tmp = (index_t)read_atomic_ul(&fsc->parwork.last_i);
+      parwork_unlock(&fsc->parwork);
+
+      if (tmp >= next_i)
+	break ;
+
+      /* contribute to work */
       parwork_next_row(fsc);
+    }
+
+    /* process the kk block sequentially */
+    sub_tri_block(fsc, i, fsc->ksize);
 
     /* sync on the parallel work, so that no
        one is working while we are updating
@@ -496,9 +367,6 @@ static void fsub_apply(fsub_context_t* fsc)
     parwork_lock(&fsc->parwork);
 
     parwork_synchronize(&fsc->parwork);
-
-    /* process the kk block sequentially */
-    sub_tri_block(fsc, i, fsc->ksize);
 
     /* update parwork area j (which is next_i) */
     fsc->parwork.j = next_i;
@@ -592,7 +460,8 @@ fsub_apply_ref(matrix_t* a, vector_t* x, const vector_t* b)
 }
 
 
-static void fsub_apply_seq(matrix_t* a, vector_t* b)
+static void __attribute__((unused))
+fsub_apply_seq(matrix_t* a, vector_t* b)
 {
   /* b -= aij * x, a triangle of size n */
 
@@ -620,11 +489,17 @@ int main(int ac, char** av)
 {
   fsub_context_t fsc;
 
+  int error = 0;
+
   matrix_t* a = NULL;
   matrix_t* const_a = NULL;
   vector_t* x = NULL;
   vector_t* const_b = NULL;
   vector_t* b = NULL;
+
+#if CONFIG_SEQ
+  vector_t* bseq = NULL;
+#endif
 
   if (matrix_create_lower(&const_a, CONFIG_ASIZE) == -1)
     goto on_error;
@@ -635,6 +510,10 @@ int main(int ac, char** av)
     goto on_error;
   if (vector_create_empty(&b, CONFIG_ASIZE) == -1)
     goto on_error;
+#if CONFIG_SEQ
+  if (vector_create_empty(&bseq, CONFIG_ASIZE) == -1)
+    goto on_error;
+#endif
 
   if (vector_create_empty(&x, CONFIG_ASIZE) == -1)
     goto on_error;
@@ -649,35 +528,52 @@ int main(int ac, char** av)
 
     matrix_copy(a, const_a);
     vector_copy(b, const_b);
-
-    /* ref first since fsub_apply modifies */
-    gettimeofday(&tms[0], NULL);
-#if CONFIG_CHECK
-    fsub_apply_ref(a, x, const_b);
-#else
-    fsub_apply_seq(a, b);
+#if CONFIG_SEQ
+    vector_copy(bseq, const_b);
 #endif
-    gettimeofday(&tms[1], NULL);
-    timersub(&tms[1], &tms[0], &tms[2]);
 
     gettimeofday(&tms[0], NULL);
     fsub_apply(&fsc);
     gettimeofday(&tms[1], NULL);
+    timersub(&tms[1], &tms[0], &tms[2]);
+
+#if CONFIG_CHECK
+    fsub_apply_ref(a, x, const_b);
+#endif
+
+#if CONFIG_SEQ
+    gettimeofday(&tms[0], NULL);
+    fsub_apply_seq(a, bseq);
+    gettimeofday(&tms[1], NULL);
     timersub(&tms[1], &tms[0], &tms[3]);
+#endif
 
 #if CONFIG_TIME
-    printf("times: seq=%lu par=%lu\n",
-	   tms[2].tv_sec * 1000000 + tms[2].tv_usec,
-	   tms[3].tv_sec * 1000000 + tms[3].tv_usec);
+    printf("par: %lu\n", tms[2].tv_sec * 1000000 + tms[2].tv_usec);
+#if CONFIG_SEQ
+    printf("seq: %lu\n", tms[3].tv_sec * 1000000 + tms[3].tv_usec);
+#endif
 #endif
 
 #if CONFIG_CHECK
-    if (vector_cmp(fsc.b, x))
+    if (vector_cmp(b, x))
     {
-      vector_print(fsc.b);
+      vector_print(b);
       vector_print(x);
-      exit(-1);
+      printf("invalid par\n");
+      error = -1;
+      goto on_error;
     }
+#if CONFIG_SEQ
+    if (vector_cmp(bseq, x))
+    {
+      /* vector_print(b); */
+      /* vector_print(x); */
+      printf("invalid seq\n");
+      error = -1;
+      goto on_error;
+    }
+#endif
 #endif
   }
 
@@ -694,6 +590,10 @@ int main(int ac, char** av)
     vector_destroy(b);
   if (const_b != NULL)
     vector_destroy(const_b);
+#if CONFIG_SEQ
+  if (bseq != NULL)
+    vector_destroy(bseq);
+#endif
 
-  return 0;
+  return error;
 }
