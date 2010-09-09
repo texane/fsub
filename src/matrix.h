@@ -8,23 +8,27 @@
 
 typedef gsl_matrix matrix_t;
 
-static inline const double* matrix_const_at
+static inline const double* __attribute__((unused))
+matrix_const_at
 (const matrix_t* m, size_t i, size_t j)
 {
   return gsl_matrix_const_ptr(m, i, j);
 }
 
-static inline double* matrix_at(matrix_t* m, size_t i, size_t j)
+static inline double* __attribute__((unused))
+matrix_at(matrix_t* m, size_t i, size_t j)
 {
   return (double*)matrix_const_at(m, i, j);
 }
 
-static inline size_t matrix_size(const matrix_t* m)
+static inline size_t __attribute__((unused))
+matrix_size(const matrix_t* m)
 {
   return m->size1;
 }
 
-static inline int matrix_create_empty(matrix_t** m, size_t n)
+static inline int __attribute__((unused))
+matrix_create_empty(matrix_t** m, size_t n)
 {
   *m = gsl_matrix_alloc(n, n);
   if (*m == NULL)
@@ -32,7 +36,8 @@ static inline int matrix_create_empty(matrix_t** m, size_t n)
   return 0;
 }
 
-static int matrix_create_lower(matrix_t** m, size_t n)
+static int __attribute__((unused))
+matrix_create_lower(matrix_t** m, size_t n)
 { 
   /* create a lower triangular matrix.
      the digaonal is filled with ones.
@@ -53,17 +58,20 @@ static int matrix_create_lower(matrix_t** m, size_t n)
   return 0;
 }
 
-static void matrix_destroy(matrix_t* m)
+static void __attribute__((unused))
+matrix_destroy(matrix_t* m)
 {
   gsl_matrix_free(m);
 }
 
-static void matrix_copy(matrix_t* a, const matrix_t* b)
+static void __attribute__((unused))
+matrix_copy(matrix_t* a, const matrix_t* b)
 {
   gsl_matrix_memcpy(a, b);
 }
 
-static void __attribute__((unused)) matrix_print(const matrix_t* m)
+static void __attribute__((unused))
+matrix_print(const matrix_t* m)
 {
   const size_t size = m->size1;
 

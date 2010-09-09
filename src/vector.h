@@ -9,22 +9,26 @@
 typedef gsl_vector vector_t;
 
 
-static inline const double* vector_const_at(const vector_t* v, size_t i)
+static inline const double* __attribute__((unused))
+vector_const_at(const vector_t* v, size_t i)
 {
   return gsl_vector_const_ptr(v, i);
 }
 
-static inline double* vector_at(vector_t* v, size_t i)
+static inline double* __attribute__((unused))
+vector_at(vector_t* v, size_t i)
 {
   return (double*)vector_const_at(v, i);
 }
 
-static inline size_t vector_size(const vector_t* v)
+static inline size_t __attribute__((unused))
+vector_size(const vector_t* v)
 {
   return v->size;
 }
 
-static inline int vector_create_empty(vector_t** v, size_t n)
+static inline int __attribute__((unused))
+vector_create_empty(vector_t** v, size_t n)
 {
   *v = gsl_vector_alloc(n);
   if (*v == NULL)
@@ -33,7 +37,8 @@ static inline int vector_create_empty(vector_t** v, size_t n)
   return 0;
 }
 
-static int vector_create(vector_t** v, size_t n)
+static int __attribute__((unused))
+vector_create(vector_t** v, size_t n)
 {
   if (vector_create_empty(v, n) == -1)
     return -1;
@@ -46,12 +51,14 @@ static int vector_create(vector_t** v, size_t n)
   return 0;
 }
 
-static inline void vector_destroy(vector_t* v)
+static inline void __attribute__((unused))
+vector_destroy(vector_t* v)
 {
   gsl_vector_free(v);
 }
 
-static void __attribute__((unused)) vector_print(const vector_t* v)
+static void __attribute__((unused))
+vector_print(const vector_t* v)
 {
   size_t i;
   for (i = 0; i < v->size; ++i)
@@ -59,7 +66,8 @@ static void __attribute__((unused)) vector_print(const vector_t* v)
   printf("\n");
 }
 
-static inline void vector_copy(vector_t* a, const vector_t* b)
+static inline void __attribute__((unused))
+vector_copy(vector_t* a, const vector_t* b)
 {
   gsl_vector_memcpy(a, b);
 }
