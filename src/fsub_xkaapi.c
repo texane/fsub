@@ -125,18 +125,17 @@ static void process_par_block
 
 static int extract_seq_block(task_context_t* tc, block_t* sb)
 {
-  /* extract the next block to be processed sequentially */
+  /* extract the next seq block SEQ_GRAIN rows at a time */
+
+  sb->n = CONFIG_SEQ_GRAIN;
 
   spinlock_lock(&tc->lock);
 
-  /* extract CONFIG_SEQ_GRAIN rows at a time */
-  sb->n = CONFIG_SEQ_GRAIN;
   if (sb->n > tc->block.n)
   {
-    if (tc->block.n == 0)
-      goto on_error;
-
     sb->n = tc->block.n;
+    if (sb->n == 0)
+      goto on_error;
   }
 
   sb->i = tc->block.i;
@@ -157,7 +156,6 @@ static void thief_entry(void*, kaapi_thread_t*);
 static int split_par_block
 (kaapi_stealcontext_t* sc, int nreq, kaapi_request_t* reqs, void* arg)
 {
-  const int saved_nreq = nreq;
   int nrep = 0;
 
   /* victim task context */
@@ -167,7 +165,10 @@ static int split_par_block
   spinlock_lock(&vtc->lock);
 
   if (vtc->block.n <= CONFIG_PAR_GRAIN)
+  {
+    spinlock_unlock(&vtc->lock);
     goto on_error;
+  }
 
   size_t unit_size = vtc->block.n / (nreq + 1);
   if (unit_size <= CONFIG_PAR_GRAIN)
@@ -230,7 +231,7 @@ static int split_par_block
   }
 
  on_error:
-  return saved_nreq - nrep;
+  return nrep;
 }
 
 static int reduce_thief
@@ -238,6 +239,8 @@ static int reduce_thief
 {
   task_context_t* const vtc = vptr;
   task_context_t* const ttc = tptr;
+
+  printf("R\n");
 
   /* conccurrent with splitter */
   spinlock_lock(&vtc->lock);
@@ -271,6 +274,7 @@ static void sync_par_block(task_context_t* tc)
   while (1)
   {
     block_t sb;
+
     while (extract_seq_block(tc, &sb) != -1)
       process_seq_block(tc, sb.i, sb.j, sb.m, sb.n);
 
@@ -291,29 +295,37 @@ static void thief_entry(void* arg, kaapi_thread_t* thread)
   tc->sc = kaapi_thread_pushstealcontext
     (thread, KAAPI_STEALCONTEXT_DEFAULT, split_par_block, arg, tc->msc);
 
- redo_work:
-  while (extract_seq_block(tc, &sb) != -1)
-  {
-    process_seq_block(tc, sb.i, sb.j, sb.m, sb.n);
+  printf("T>\n");
 
-    /* update ktr and look for preemption */
-    const int is_preempted = kaapi_preemptpoint
-      (tc->ktr, tc->sc, NULL, NULL, (void*)tc, sizeof(task_context_t), NULL);
-    if (is_preempted)
-      goto on_finalize ;
+  /* until all work is done and no more thief */
+  while (1)
+  {
+    while (extract_seq_block(tc, &sb) != -1)
+    {
+      printf("T %lu - %lu\n", sb.i, sb.n);
+
+      process_seq_block(tc, sb.i, sb.j, sb.m, sb.n);
+
+      /* update ktr and look for preemption */
+      const int is_preempted = kaapi_preemptpoint
+	(tc->ktr, tc->sc, NULL, NULL, (void*)tc, sizeof(task_context_t), NULL);
+      if (is_preempted)
+	goto on_finalize;
+    }
+
+    /* update ktr */
+    ((task_context_t*)tc->ktr->data)->block.n = 0;
+
+    /* retrieve thieves */
+    kaapi_taskadaptive_result_t* const ktr = kaapi_get_thief_head(tc->sc);
+    if (ktr == NULL)
+      goto on_finalize;
+
+    kaapi_preempt_thief(tc->sc, ktr, NULL, reduce_thief, tc);
   }
 
-  /* update ktr */
-  ((task_context_t*)tc->ktr->data)->block.n = 0;
-
-  /* retrieve thieves */
-  kaapi_taskadaptive_result_t* const ktr = kaapi_get_thief_head(tc->sc);
-  if (ktr == NULL)
-    return ;
-  kaapi_preempt_thief(tc->sc, ktr, NULL, reduce_thief, tc);
-  goto redo_work;
-
  on_finalize:
+  printf("T<\n");
   kaapi_steal_finalize(tc->sc);
 }
 
@@ -330,8 +342,12 @@ static void master_entry(void* arg, kaapi_thread_t* thread)
   tc->sc = kaapi_thread_pushstealcontext
     (thread, KAAPI_STEALCONTEXT_DEFAULT, split_par_block, arg, tc->msc);
 
+  printf("M0\n");
+
   /* process llblock(0) */
   process_seq_tri(tc, 0, fsc->lsize);
+
+  printf("M1\n");
 
   /* foreach kkblock */
   const index_t last_i = (llcount - 1) * fsc->lsize;
@@ -356,14 +372,22 @@ static void master_entry(void* arg, kaapi_thread_t* thread)
     sync_par_block(tc);
   }
 
+  printf("M2\n");
+
   /* process remaining left block */
   process_seq_block(tc, i, 0, i - fsc->ksize, asize - i);
+
+  printf("M3\n");
 
   /* process llblock(llcount - 1) */
   if (llcount > 1)
     process_seq_tri(tc, i, fsc->lsize);
 
+  printf("M4\n");
+
   kaapi_steal_finalize(tc->sc);
+
+  printf("M5\n");
 }
 
 

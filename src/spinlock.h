@@ -18,7 +18,7 @@ static inline int spinlock_trylock(spinlock_t* l)
 
 static inline void spinlock_lock(spinlock_t* l)
 {
-  while (!spinlock_trylock(l))
+  while (spinlock_trylock(l) == 0)
     ;
 }
 

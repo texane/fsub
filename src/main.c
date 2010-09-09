@@ -105,23 +105,23 @@ int main(int ac, char** av)
 #if CONFIG_FSUB_SEQ
     if (vector_cmp(bseq, x))
     {
-      vector_print(b);
-      vector_print(x);
       printf("invalid seq\n");
       error = -1;
-      goto on_error;
     }
 #endif
 #if CONFIG_FSUB_PTHREAD || CONFIG_FSUB_XKAAPI
     if (vector_cmp(b, x))
     {
-      vector_print(b);
-      vector_print(x);
       printf("invalid parallel\n");
       error = -1;
-      goto on_error;
     }
 #endif
+    if (error == -1)
+    {
+      vector_print(b);
+      vector_print(x);
+      goto on_error;
+    }
 #endif
   }
 
