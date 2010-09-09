@@ -4,14 +4,7 @@
 #include "matrix.h"
 #include "spinlock.h"
 #include "atomic.h"
-
-
-/* static config */
-#define CONFIG_KSIZE (20)
-#define CONFIG_LSIZE (1 * CONFIG_KSIZE)
-#define CONFIG_ASIZE (100 * CONFIG_LSIZE)
-#define CONFIG_PAR_GRAIN (1)
-#define CONFIG_SEQ_GRAIN (1)
+#include "config.h"
 
 
 /* forward substitution context */

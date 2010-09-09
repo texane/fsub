@@ -25,7 +25,8 @@ struct fsub_context;
 typedef struct thread_block
 {
 #define THREAD_STATE_ZERO 0
-#define THREAD_STATE_DONE 1
+#define THREAD_STATE_STEAL 1
+#define THREAD_STATE_DONE 2
   volatile unsigned long state;
 
   pthread_t thread;
@@ -66,8 +67,8 @@ typedef struct parwork
 typedef struct fsub_context
 {
   /* ax = b; */
-  const matrix_t* a;
-  vector_t* b;
+  const matrix_t* volatile a;
+  vector_t* volatile b;
 
   /* size of a kxk block */
   size_t ksize;
@@ -189,6 +190,11 @@ static void* parwork_entry(void* p)
       return NULL;
       break;
 
+      /* wait until work avail */
+    case THREAD_STATE_ZERO:
+      break;
+
+    case THREAD_STATE_STEAL:
     default:
       /* process next row in parallel area */
       parwork_next_rows(fsc);
@@ -291,8 +297,19 @@ void fsub_pthread_apply(const matrix_t* a, vector_t* b)
   /* assume (matrix_size(fsc->a) % fsc->lsize) == 0 */
 
   fsub_context_t* const fsc = &global_fsc;
-  fsc->a = a;
-  fsc->b = b;
+
+  /* fixme, should not rely on it */
+  if (fsc->a == NULL)
+  {
+    fsc->a = a;
+    fsc->b = b;
+    __sync_synchronize();
+
+    /* wake threads up */
+    size_t tid;
+    for (tid = 0; tid < CONFIG_THREAD_COUNT; ++tid)
+      fsc->pool.tbs[tid].state = THREAD_STATE_STEAL;
+  }
 
   const size_t llcount = matrix_size(fsc->a) / fsc->lsize;
 
@@ -366,6 +383,9 @@ void fsub_pthread_apply(const matrix_t* a, vector_t* b)
 void fsub_pthread_initialize(void)
 {
   fsub_context_t* const fsc = &global_fsc;
+
+  fsc->a = NULL;
+  fsc->b = NULL;
 
   fsc->ksize = CONFIG_KSIZE;
   fsc->lsize = CONFIG_LSIZE;

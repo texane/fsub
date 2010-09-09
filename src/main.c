@@ -72,9 +72,14 @@ int main(int ac, char** av)
     fsub_pthread_apply(const_a, b);
     gettimeofday(&tms[1], NULL);
     timersub(&tms[1], &tms[0], &tms[2]);
+#elif CONFIG_FSUB_XKAAPI
+    gettimeofday(&tms[0], NULL);
+    fsub_xkaapi_apply(const_a, b);
+    gettimeofday(&tms[1], NULL);
+    timersub(&tms[1], &tms[0], &tms[2]);
 #endif
 
-#if CONFIG_GSUB_GSL
+#if CONFIG_FSUB_GSL
     fsub_gsl_apply(a, x, const_b);
 #endif
 
@@ -85,14 +90,18 @@ int main(int ac, char** av)
     timersub(&tms[1], &tms[0], &tms[3]);
 #endif
 
+    /* report times */
 #if CONFIG_TIME
+#if CONFIG_FSUB_PTHREAD || CONFIG_FSUB_XKAAPI
     printf("par: %lu\n", tms[2].tv_sec * 1000000 + tms[2].tv_usec);
+#endif
 #if CONFIG_FSUB_SEQ
     printf("seq: %lu\n", tms[3].tv_sec * 1000000 + tms[3].tv_usec);
 #endif
 #endif
 
-#if CONFIG_FSUB_GSL /* check against gsl implm */
+    /* check against gsl implm */
+#if CONFIG_FSUB_GSL
 #if CONFIG_FSUB_SEQ
     if (vector_cmp(bseq, x))
     {
@@ -103,14 +112,16 @@ int main(int ac, char** av)
       goto on_error;
     }
 #endif
+#if CONFIG_FSUB_PTHREAD || CONFIG_FSUB_XKAAPI
     if (vector_cmp(b, x))
     {
       vector_print(b);
       vector_print(x);
-      printf("invalid par\n");
+      printf("invalid parallel\n");
       error = -1;
       goto on_error;
     }
+#endif
 #endif
   }
 

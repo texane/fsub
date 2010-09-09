@@ -7,4 +7,5 @@ gcc -std=gnu99 -Wall -O3 -march=native \
 ../src/fsub_pthread.c \
 ../src/fsub_xkaapi.c \
 -L$HOME/install/xkaapi_master/lib \
--lxkaapi -lpthread -lgsl -lblas
+-lpthread -lgsl -lblas -lxkaapi
+

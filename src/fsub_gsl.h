@@ -2,10 +2,10 @@
 #define FSUB_GSL_INCLUDED_H
 
 
-struct matrix;
-struct vector;
+#include "matrix.h"
+#include "vector.h"
 
-void fsub_gsl_apply(struct matrix*, struct vector*, struct vector*, const struct vector*);
+void fsub_gsl_apply(matrix_t*, vector_t*, const vector_t*);
 
 
 #endif /* ! FSUB_GSL_INCLUDED_H */
