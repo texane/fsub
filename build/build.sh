@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 gcc -std=gnu99 -Wall -O3 -march=native \
 -I. -I$HOME/install/xkaapi_master/include \
--DNDEBUG=0 -ggdb \
+-DNDEBUG=1 \
 ../src/main.c \
 ../src/fsub_gsl.c \
 ../src/fsub_seq.c \

@@ -204,7 +204,7 @@ static int split_par_block
 
   block_t stolen_block;
   stolen_block.n = unit_size * nreq;
-  stolen_block.i = vtc->block.i + vtc->block.m - stolen_block.n;
+  stolen_block.i = vtc->block.i + vtc->block.n - stolen_block.n;
   stolen_block.j = vtc->block.j;
   stolen_block.m = vtc->block.m;
 
