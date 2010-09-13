@@ -2,7 +2,7 @@
 # define CONFIG_H_INCLUDED
 
 
-#define CONFIG_KSIZE (20)
+#define CONFIG_KSIZE (100)
 #define CONFIG_LSIZE (1 * CONFIG_KSIZE)
 #define CONFIG_ASIZE (10 * CONFIG_LSIZE)
 #define CONFIG_ITER_COUNT 5
@@ -18,7 +18,7 @@
 /* xkaapi config */
 #define CONFIG_FSUB_XKAAPI 1
 #define CONFIG_PAR_GRAIN 1
-#define CONFIG_SEQ_GRAIN 1
+#define CONFIG_SEQ_GRAIN 10
 
 
 #endif /* ! CONFIG_H_INCLUDED */

@@ -79,6 +79,8 @@ typedef struct task_context
 
 } task_context_t;
 
+typedef block_t task_result_t;
+
 static void process_seq_tri(task_context_t* tc, index_t i, size_t n)
 {
   /* sequentially process a triangle */
@@ -223,8 +225,8 @@ static int split_par_block
     kaapi_task_t* const thief_task = kaapi_thread_toptask(thief_thread);
 
     kaapi_taskadaptive_result_t* const ktr =
-      kaapi_allocate_thief_result(sc, sizeof(task_context_t), NULL);
-    ((task_context_t*)ktr->data)->block.n = 0;
+      kaapi_allocate_thief_result(sc, sizeof(task_result_t), NULL);
+    ((task_result_t*)ktr->data)->n = 0;
 
     task_context_t* const thief_tc = kaapi_thread_pushdata_align
       (thief_thread, sizeof(task_context_t), 8);
@@ -258,14 +260,14 @@ static int reduce_thief
 (kaapi_stealcontext_t* sc, void* targ, void* tptr, size_t tsize, void* vptr)
 {
   task_context_t* const vtc = vptr;
-  task_context_t* const ttc = tptr;
+  task_result_t* const tr = tptr;
 
   /* conccurrent with splitter */
   spinlock_lock(&vtc->lock);
 
   /* retrieve work */
-  vtc->block.i = ttc->block.i;
-  vtc->block.n = ttc->block.n;
+  vtc->block.i = tr->i;
+  vtc->block.n = tr->n;
 
   spinlock_unlock(&vtc->lock);
 
@@ -322,13 +324,14 @@ static void thief_entry(void* arg, kaapi_thread_t* thread)
 
       /* update ktr and look for preemption */
       const int is_preempted = kaapi_preemptpoint
-	(tc->ktr, tc->sc, NULL, NULL, (void*)tc, sizeof(task_context_t), NULL);
+	(tc->ktr, tc->sc, NULL, NULL, (void*)&tc->block,
+	 sizeof(task_result_t), NULL);
       if (is_preempted)
 	goto on_finalize;
     }
 
     /* update ktr */
-    ((task_context_t*)tc->ktr->data)->block.n = 0;
+    ((task_result_t*)tc->ktr->data)->n = 0;
 
     /* retrieve thieves */
     kaapi_taskadaptive_result_t* const ktr = kaapi_get_thief_head(tc->sc);
