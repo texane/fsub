@@ -102,25 +102,50 @@ static void process_seq_tri(task_context_t* tc, index_t i, size_t n)
   }
 }
 
-static void process_seq_block
+static void process_seq_block_common
+(task_context_t* tc, index_t i, index_t j, size_t m, size_t n, int do_lock)
+{
+  const matrix_t* const a = tc->fsc->a;
+  vector_t* const b = tc->fsc->b;
+
+  const index_t saved_j = j;
+
+  const index_t last_i = i + n;
+  const index_t last_j = j + m;
+
+  for (; i < last_i; ++i)
+  {
+    double sum = 0.f;
+    for (j = saved_j; j < last_j; ++j)
+      sum += *matrix_const_at(a, i, j) * *vector_at(b, j);
+
+    if (do_lock)
+    {
+      spinlock_lock(&tc->fsc->b_lock);
+      *vector_at(b, i) -= sum;
+      spinlock_unlock(&tc->fsc->b_lock);
+    }
+    else
+    {
+      *vector_at(b, i) -= sum;
+    }
+  }
+}
+
+static inline void process_seq_block
 (task_context_t* tc, index_t i, index_t j, size_t m, size_t n)
 {
   /* sequentially process the block */
+  process_seq_block_common(tc, i, j, m, n, 0);
 }
 
-static void process_par_block
+static inline void process_seq_block_with_lock
 (task_context_t* tc, index_t i, index_t j, size_t m, size_t n)
 {
   /* process the block. since b may be updated in
      parallel we accumulate in a local variable
    */
-
-#if 0
-  double sum = 0.f;
-  lock(fsc->b_lock);
-  *vector_at(fsc->b, i) = sum;
-  unlock(fsc->b_lock);
-#endif
+  process_seq_block_common(tc, i, j, m, n, 1);
 }
 
 static int extract_seq_block(task_context_t* tc, block_t* sb)
@@ -171,7 +196,7 @@ static int split_par_block
   }
 
   size_t unit_size = vtc->block.n / (nreq + 1);
-  if (unit_size <= CONFIG_PAR_GRAIN)
+  if (unit_size < CONFIG_PAR_GRAIN)
   {
     unit_size = CONFIG_PAR_GRAIN;
     nreq = (vtc->block.n / CONFIG_PAR_GRAIN) - 1;
@@ -192,11 +217,6 @@ static int split_par_block
   {
     if (!kaapi_request_ok(reqs))
       continue ;
-
-#if 0 /* useless, this is a multiple */
-    if (unit_size > stolen_block.n)
-      unit_size = stolen_block.n;
-#endif
 
     /* push the remote task */
     kaapi_thread_t* const thief_thread = kaapi_request_getthread(reqs);
@@ -240,8 +260,6 @@ static int reduce_thief
   task_context_t* const vtc = vptr;
   task_context_t* const ttc = tptr;
 
-  printf("R\n");
-
   /* conccurrent with splitter */
   spinlock_lock(&vtc->lock);
 
@@ -276,7 +294,7 @@ static void sync_par_block(task_context_t* tc)
     block_t sb;
 
     while (extract_seq_block(tc, &sb) != -1)
-      process_seq_block(tc, sb.i, sb.j, sb.m, sb.n);
+      process_seq_block_with_lock(tc, sb.i, sb.j, sb.m, sb.n);
 
     kaapi_taskadaptive_result_t* const ktr = kaapi_get_thief_head(tc->sc);
     if (ktr == NULL)
@@ -295,16 +313,12 @@ static void thief_entry(void* arg, kaapi_thread_t* thread)
   tc->sc = kaapi_thread_pushstealcontext
     (thread, KAAPI_STEALCONTEXT_DEFAULT, split_par_block, arg, tc->msc);
 
-  printf("T>\n");
-
   /* until all work is done and no more thief */
   while (1)
   {
     while (extract_seq_block(tc, &sb) != -1)
     {
-      printf("T %lu - %lu\n", sb.i, sb.n);
-
-      process_seq_block(tc, sb.i, sb.j, sb.m, sb.n);
+      process_seq_block_with_lock(tc, sb.i, sb.j, sb.m, sb.n);
 
       /* update ktr and look for preemption */
       const int is_preempted = kaapi_preemptpoint
@@ -325,7 +339,6 @@ static void thief_entry(void* arg, kaapi_thread_t* thread)
   }
 
  on_finalize:
-  printf("T<\n");
   kaapi_steal_finalize(tc->sc);
 }
 
@@ -342,12 +355,8 @@ static void master_entry(void* arg, kaapi_thread_t* thread)
   tc->sc = kaapi_thread_pushstealcontext
     (thread, KAAPI_STEALCONTEXT_DEFAULT, split_par_block, arg, tc->msc);
 
-  printf("M0\n");
-
   /* process llblock(0) */
   process_seq_tri(tc, 0, fsc->lsize);
-
-  printf("M1\n");
 
   /* foreach kkblock */
   const index_t last_i = (llcount - 1) * fsc->lsize;
@@ -372,22 +381,14 @@ static void master_entry(void* arg, kaapi_thread_t* thread)
     sync_par_block(tc);
   }
 
-  printf("M2\n");
-
   /* process remaining left block */
   process_seq_block(tc, i, 0, i - fsc->ksize, asize - i);
-
-  printf("M3\n");
 
   /* process llblock(llcount - 1) */
   if (llcount > 1)
     process_seq_tri(tc, i, fsc->lsize);
 
-  printf("M4\n");
-
   kaapi_steal_finalize(tc->sc);
-
-  printf("M5\n");
 }
 
 
